@@ -7253,14 +7253,16 @@ void TypeChecker::validateDecl(ValueDecl *D) {
         break;
 
       // For setters and observers, set the old/new value parameter's type
-      // to the value type.
+      // to the value type if it exists.
       case AccessorKind::IsDidSet:
       case AccessorKind::IsWillSet:
       case AccessorKind::IsSetter: {
-        auto newValueParam = valueParams->get(0);
-        newValueParam->setType(valueTy);
-        newValueParam->setInterfaceType(valueIfaceTy);
-        newValueParam->getTypeLoc().setType(valueTy);
+        if (valueParams->size() > 0) {
+          auto newValueParam = valueParams->get(0);
+          newValueParam->setType(valueTy);
+          newValueParam->setInterfaceType(valueIfaceTy);
+          newValueParam->getTypeLoc().setType(valueTy);
+        }
         break;
       }
 

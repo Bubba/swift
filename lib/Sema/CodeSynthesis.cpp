@@ -894,6 +894,31 @@ void TypeChecker::synthesizeWitnessAccessorsForStorage(
     addMaterializeForSet(storage, *this);
 }
 
+namespace {
+/// This ASTWalker explores an expression tree looking for a DeclRefExprs
+/// that reference a specific ValueDecl, and reports if one exists.
+class DeclRefExprWalker : public ASTWalker {
+  ValueDecl *VD;
+
+public:
+  DeclRefExprWalker(ValueDecl *VD) : VD(VD) {}
+
+  bool exists = false;
+
+  std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+
+    if (auto DRE = dyn_cast<DeclRefExpr>(E)) {
+      if (DRE->getDecl() == VD) {
+        exists = true;
+        return {false, NULL};
+      }
+    }
+
+    return {true, E};
+  }
+};
+} // end anonymous namespace
+
 /// Given a VarDecl with a willSet: and/or didSet: specifier, synthesize the
 /// (trivial) getter and the setter, which calls these.
 void swift::synthesizeObservingAccessors(VarDecl *VD, TypeChecker &TC) {
@@ -917,31 +942,52 @@ void swift::synthesizeObservingAccessors(VarDecl *VD, TypeChecker &TC) {
   auto *SelfDecl = Set->getImplicitSelfDecl();
   VarDecl *ValueDecl = Set->getParameterLists().back()->get(0);
 
-  // The setter loads the oldValue, invokes willSet with the incoming value,
-  // does a direct store, then invokes didSet with the oldValue.
+  // The setter loads the oldValue if needed, invokes willSet with the
+  // incoming value, does a direct store, then invokes didSet with the oldValue.
   SmallVector<ASTNode, 6> SetterBody;
 
-  // If there is a didSet, it will take the old value.  Load it into a temporary
-  // 'let' so we have it for later.
-  // TODO: check the body of didSet to only do this load (which may call the
-  // superclass getter) if didSet takes an argument.
+  // If there is a didSet, it may take the old value. We may load it into a
+  // temporary 'let' so we have it for later.
   VarDecl *OldValue = nullptr;
-  if (VD->getDidSetFunc()) {
-    Expr *OldValueExpr
-      = createPropertyLoadOrCallSuperclassGetter(Set, VD, TC);
 
-    OldValue = new (Ctx) VarDecl(/*IsStatic*/false, VarDecl::Specifier::Let,
-                                 /*IsCaptureList*/false, SourceLoc(),
-                                 Ctx.getIdentifier("tmp"), Type(), Set);
-    OldValue->setImplicit();
-    auto *tmpPattern = new (Ctx) NamedPattern(OldValue, /*implicit*/ true);
-    auto tmpPBD = PatternBindingDecl::create(Ctx, SourceLoc(),
-                                             StaticSpellingKind::None,
-                                             SourceLoc(),
-                                             tmpPattern, OldValueExpr, Set);
-    tmpPBD->setImplicit();
-    SetterBody.push_back(tmpPBD);
-    SetterBody.push_back(OldValue);
+  if (auto didSet = VD->getDidSetFunc()) {
+    
+    // Check if didSet uses the oldValue parameter.
+    auto *oldValueParam = didSet->getParameterLists().back()->get(0);
+    auto walker = DeclRefExprWalker(oldValueParam);
+    didSet->getBody()->walk(walker);
+    
+    // If oldValue was used, load it into the temporary 'let'.
+    if (walker.exists) {
+      Expr *OldValueExpr =
+          createPropertyLoadOrCallSuperclassGetter(Set, VD, TC);
+
+      OldValue = new (Ctx) VarDecl(/*IsStatic*/ false, VarDecl::Specifier::Let,
+                                   /*IsCaptureList*/ false, SourceLoc(),
+                                   Ctx.getIdentifier("tmp"), Type(), Set);
+      OldValue->setImplicit();
+      auto *tmpPattern = new (Ctx) NamedPattern(OldValue, /*implicit*/ true);
+      auto tmpPBD = PatternBindingDecl::create(
+          Ctx, SourceLoc(), StaticSpellingKind::None, SourceLoc(), tmpPattern,
+          OldValueExpr, Set);
+      tmpPBD->setImplicit();
+      SetterBody.push_back(tmpPBD);
+      SetterBody.push_back(OldValue);
+    } else {
+      // Otherwise, remove the parameter.
+      auto emptyParams = ParameterList::createEmpty(Ctx);
+      didSet->getParameterLists()[didSet->getNumParameterLists() - 1] = emptyParams;
+      
+      if (didSet->hasInterfaceType()) {
+        auto type = didSet->getInterfaceType();
+        auto funcType = dyn_cast<FunctionType>(type->getCanonicalType());
+//        auto tuple = TupleType({}, &Ctx, RecursiveTypeProperties(), false);
+//        auto tupleType = TupleType::get({}, Ctx);
+        ArrayRef<AnyFunctionType::Param> params = {};
+        auto newType = FunctionType::get(params, funcType->getResult(), funcType->getExtInfo());
+        didSet->setInterfaceType(newType);
+      }
+    }
   }
 
   // Create:
@@ -979,16 +1025,22 @@ void swift::synthesizeObservingAccessors(VarDecl *VD, TypeChecker &TC) {
   // or:
   //   (call_expr (decl_ref_expr(didSet)), (decl_ref_expr(tmp)))
   if (auto didSet = VD->getDidSetFunc()) {
-    auto *OldValueExpr = new (Ctx) DeclRefExpr(OldValue, DeclNameLoc(),
-                                               /*impl*/true);
     Expr *Callee = new (Ctx) DeclRefExpr(didSet, DeclNameLoc(), /*imp*/true);
     if (SelfDecl) {
       auto *SelfDRE = new (Ctx) DeclRefExpr(SelfDecl, DeclNameLoc(),
                                             /*imp*/true);
       Callee = new (Ctx) DotSyntaxCallExpr(Callee, SourceLoc(), SelfDRE);
     }
-    SetterBody.push_back(CallExpr::createImplicit(Ctx, Callee, { OldValueExpr },
-                                                  { Identifier() }));
+
+    if (OldValue) {
+      auto *OldValueExpr = new (Ctx) DeclRefExpr(OldValue, DeclNameLoc(),
+                                                 /*impl*/ true);
+
+      SetterBody.push_back(CallExpr::createImplicit(Ctx, Callee, {OldValueExpr},
+                                                    {Identifier()}));
+    } else {
+      SetterBody.push_back(CallExpr::createImplicit(Ctx, Callee, {}, {}));
+    }
 
     // Make sure the didSet/willSet accessors are marked final if in a class.
     if (!didSet->isFinal() &&
